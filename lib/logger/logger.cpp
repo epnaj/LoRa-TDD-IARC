@@ -1,5 +1,8 @@
 #include "logger.hpp"
 
+/*
+SPAWNS OWN THREAD
+*/
 void Logger::start(const std::string &filename) {
     if (Logger::runLogThread.load()) {
         return;
@@ -20,6 +23,9 @@ void Logger::start(const std::string &filename) {
     );
 }
 
+/*
+SPAWNS OWN THREAD
+*/
 void Logger::startWithStdout(const std::string &filename) {
     if (Logger::runLogThread.load()) {
         return;

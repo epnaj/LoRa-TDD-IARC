@@ -25,7 +25,7 @@ this is the only class that should interact with outside world.
 */
 class ManagerStrategyBase {
 public:
-    virtual bool send(const BaseMessage &message) = 0;
+    virtual void send(const BaseMessage &message) = 0;
     virtual void listenAndReceive(ThreadSafeQueue <MessageVariant> &receivedMessagesQueue) = 0;
 };
 

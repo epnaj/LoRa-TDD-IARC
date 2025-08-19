@@ -6,7 +6,7 @@
 
 #include "logger.hpp"
 #include "base_message.hpp"
-#include "message_ok.hpp"
+#include "message_ack.hpp"
 #include "message_address.hpp"
 
 template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
@@ -14,21 +14,24 @@ template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 using MessageVariant = std::variant <
     BadMessage,
-    OKMessage,
+    MessageACK,
     MessageAddress
 >;
 
 inline MessageVariant decodeFromBytes(const std::vector <uint8_t> &data) {
-    Logger::debug(__func__, "DECODE FROM BYTES");
-    if (!data.size()) {
+    static constexpr auto TAG{"DECODE FROM BYTES"};
+    Logger::debug(TAG, "DECODE FROM BYTES");
+    // if message doesn't contain these fields it means message is faulty
+    if (data.size() < BaseMessage::envelopeSize) {
         return BadMessage();
     }
-    
+
     MessageVariant messageVariant = BadMessage();
-    switch (*(reinterpret_cast <const messageIdType *> (data.data())))
+    // switch (*(reinterpret_cast <const messageIdType *> (data.data() + 2 * sizeof(addressType))))
+    switch (*(reinterpret_cast <const messageIdType *> (data[BaseMessage::addressingSize])))
     {
-    case MESSAGE_OK:
-        messageVariant = OKMessage();
+    case MESSAGE_ACK:
+        messageVariant = MessageACK();
         break;
 
     case MESSAGE_ADDRESS:
@@ -36,12 +39,15 @@ inline MessageVariant decodeFromBytes(const std::vector <uint8_t> &data) {
         break;
         
     default:
-        Logger::error(__func__, "COULDN'T DECODE MESSAGE, RETURNING BAD MESSAGE!");
+        Logger::error(TAG, "COULDN'T DECODE MESSAGE, RETURNING BAD MESSAGE!");
         break;
     }
+
+    // we visit here in order to setup proper memory layout
+    // it could be done later, but user would have to remember about it :/
     std::visit(
         [&data](auto &&variant){
-            Logger::debug(__func__, variant.name());
+            Logger::debug(TAG, "Decoding: " + variant.name());
             variant.decodeFromBytes(data);
         },
         messageVariant
