@@ -1,12 +1,40 @@
 #include <iostream>
 #include <atomic>
 
-#include "manager.hpp"
+#include "lora_manager.hpp"
 #include "thread_safe_queue.hpp"
 #include "logger.hpp"
 
+class MockLoRaDevice : public LoRaDevice {
+public:
+    void registerReceivedMessagesQueue(ThreadSafeQueue <std::vector <uint8_t>> &queue) override {
+        receivedBytesQueue = &queue;
+    }
+
+    void unregisterReceivedMessagesQueue() override {
+        if (receivedBytesQueue) {
+            receivedBytesQueue = nullptr;
+        }
+    }
+
+    bool send(
+        const std::vector <uint8_t> &bytes, 
+        const std::chrono::milliseconds timeoutMs
+    ) {
+        // send away
+    }
+
+    
+private:
+    ThreadSafeQueue <std::vector <uint8_t>> *receivedBytesQueue;
+};
+
 void mainLogic() {
-    Manager manager{};
+    MockLoRaDevice mockLoRaDevice;
+    LoRaManager loraManager(
+        mockLoRaDevice,
+        0
+    );
     
 }
 

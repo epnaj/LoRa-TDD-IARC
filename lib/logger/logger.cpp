@@ -35,6 +35,10 @@ void Logger::startWithStdout(const std::string &filename) {
     Logger::fileHandler   = std::fstream(filename, std::ios::out | std::ios::app);
     Logger::loggingThread = std::thread(
         []() {
+            Logger::fileHandler << "### LOGGER-THREAD | Logging thread started!" << std::endl;
+            std::cout << "### LOGGER-THREAD | Logging thread started!" << std::endl;
+            Logger::fileHandler.flush();
+            std::cout << std::flush;
             while (Logger::runLogThread.load()) {
                 if (!Logger::loggerQueue.empty()) {
                     std::string message = Logger::loggerQueue.front();
@@ -57,8 +61,10 @@ void Logger::startWithStdout(const std::string &filename) {
 }
 
 void Logger::stop() {
-    Logger::runLogThread.store(false);
-    Logger::loggingThread.join();
+    if (Logger::runLogThread.load()) {
+        Logger::runLogThread.store(false);
+        Logger::loggingThread.join();
+    }
 
     if (Logger::fileHandler.is_open()) {
         Logger::fileHandler.close();

@@ -1,39 +1,177 @@
 #include "lora_manager.hpp"
 
-LoRaManager::LoRaManager(LoRaDevice &loraDevice):
+LoRaManager::LoRaManager(LoRaDevice &loraDevice, const addressType myAddress):
     loraDevice(loraDevice), 
     isDownlink{true},
-    runInternalThread{true}
+    runInternalThread{true},
+    myAddress{myAddress}
 {    
+    loraDevice.registerReceivedMessagesQueue(receivedBytesQueue);
     internalThread = std::thread(
         &LoRaManager::threadLogic,
-        *this
+        this
     );
 }
 
 LoRaManager::~LoRaManager() {
+    loraDevice.unregisterReceivedMessagesQueue();
     if (runInternalThread.load()) {
         runInternalThread.store(false);
     }
     internalThread.join();
 }
 
-void LoRaManager::threadLogic() {
-    while (runInternalThread.load()) {
-        // this will be divided in next patches
-        std::chrono::milliseconds timeLeftForUplinkSubFrame = sendNotAcked(notAckedQueue, FRAME_UL_DL_MS);
-        timeLeftForUplinkSubFrame = sendNewMessages(toSendQueue, timeLeftForUplinkSubFrame);
-
-        // switch to downlink to receive acks
-        isDownlink.store(true);
-
+void LoRaManager::randomAccess(std::atomic <bool> &run) {
+    // random access procedure
+    static constexpr auto TAG{"RANDOM-ACCESS"};
+    Logger::debug(TAG, "Start of random access");
+    uint8_t retries{0}, maxRetries{3};
+    while (run.load() && retries < maxRetries) {
+        MessageRandomAccess randomAccessRequest;
+        randomAccessRequest.setMessageNo(sentMessageCounter++);
         
+        isDownlink.store(false);
+        Logger::debug(TAG, "Sending RAR directly");
+        // addToSendQueue(randomAccessRequest);
+
+        loraDevice.send(
+            randomAccessRequest.sendableBytes(),
+            FRAME_UL_DL_MS
+        );
+
+        isDownlink.store(true);
+        // have some offset in case of perfect synch
+        std::this_thread::sleep_for(
+            FRAME_UL_DL_MS + (FRAME_UL_DL_MS * 0.33 * retries)
+        );
+        MessageVariant messageVariant = receiveMessage();
+        std::visit(
+            overloaded {
+                [&](MessageRandomAccessResponse &messageRAR) ->void {
+                    totalNumberOfDevicesInNetwork = messageRAR.getNumberOfNetworkUsers();
+                    myAddress = totalNumberOfDevicesInNetwork;
+                    Logger::debug(TAG, "RECEIVED MSG RAR!");
+                },
+                [&](auto &message) -> void {
+                    // ignore, wait only for random access response
+                    return;
+                }
+            },
+            messageVariant
+        );
+        ++retries;
+    }
+
+    imFirstNode.store(retries == maxRetries);
+    if (imFirstNode.load()) {
+        myAddress                     = 0;
+        frameCounter                  = 0;
+        sentMessageCounter            = 0;
+        totalNumberOfDevicesInNetwork = 1;
+    } else {
+        bool foundSynch{false};
+        while (!foundSynch) {
+            MessageVariant messageVariant = receiveMessage();
+            std::visit(
+                overloaded {
+                    [&](BadMessage &badMessage) -> void {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    },
+                    [&](auto &message) ->void {
+                        // ignore other messages
+                        return;
+                    },
+                    [&](MessageSynchronise &messageSynch) -> void {
+                        // update synch data here
+
+                        frameCounter = 0;
+                        sentMessageCounter = 0;
+                        foundSynch = true;
+                    }
+                },
+                messageVariant
+            );
+        }
+    }
+    Logger::debug(TAG, "END OF RAC DATA DUMP: My address: " + 
+        std::to_string(myAddress) +
+        " NO dev in net: " + std::to_string(totalNumberOfDevicesInNetwork) + 
+        " AM I FIRST? " + std::to_string(imFirstNode.load())
+    );
+}
+
+void LoRaManager::threadLogic() {
+    Logger::registerMyThreadName("T-LORA-" + std::to_string(myAddress) + "-INT");
+
+    while (runInternalThread.load()) {
+        if (internalThreadDelay > ZERO_MS) {
+            std::this_thread::sleep_for(internalThreadDelay);
+            internalThreadDelay = ZERO_MS;
+        }
+        
+        std::chrono::milliseconds timeLeftForFrame = FRAME_UL_DL_MS;
+        if (totalNumberOfDevicesInNetwork > 1 && (frameCounter % totalNumberOfDevicesInNetwork) == myAddress) {
+            Logger::debug("THREAD-LOGIC", "Uplink mode!");
+            // this is uplink frame procedure
+            isDownlink.store(false);
+            if (imFirstNode.load()) {
+                auto startSync = std::chrono::high_resolution_clock::now();
+                // talk directly to the driver
+                loraDevice.send(
+                    MessageSynchronise(myAddress, sentMessageCounter++).sendableBytes(),
+                    FRAME_UL_DL_MS
+                );
+                auto endSync = std::chrono::high_resolution_clock::now();
+                timeLeftForFrame = FRAME_UL_DL_MS - (
+                    std::chrono::duration_cast <std::chrono::milliseconds> (
+                        endSync - startSync
+                    )
+                );
+            }
+            
+            timeLeftForFrame = sendNotAcked(notAckedQueue, timeLeftForFrame);
+            timeLeftForFrame = sendNewMessages(toSendQueue, timeLeftForFrame);
+            
+            if (timeLeftForFrame > ZERO_MS) {
+                std::this_thread::sleep_for(timeLeftForFrame);
+                timeLeftForFrame = ZERO_MS;
+            }
+            
+            // switch to downlink to receive acks
+            isDownlink.store(true);
+            timeLeftForFrame += FRAME_ACK_MS;
+            timeLeftForFrame = receiveMessages(receivedBytesQueue, timeLeftForFrame);
+            
+            if (timeLeftForFrame > ZERO_MS) {
+                std::this_thread::sleep_for(timeLeftForFrame);
+                timeLeftForFrame = ZERO_MS;
+            }
+        } else {
+            Logger::debug("THREAD-LOGIC", "Downlink mode!");
+            // this is downlink frame procedure
+            isDownlink.store(true);
+            timeLeftForFrame = receiveMessages(receivedBytesQueue, timeLeftForFrame);
+            if (timeLeftForFrame > ZERO_MS) {
+                std::this_thread::sleep_for(timeLeftForFrame);
+                timeLeftForFrame = ZERO_MS;
+            }
+
+            // switch to uplink to send acks 
+            isDownlink.store(false);
+            timeLeftForFrame += FRAME_ACK_MS;
+            timeLeftForFrame = sendAck(toAckQueue, timeLeftForFrame);
+
+            if (timeLeftForFrame > ZERO_MS) {
+                std::this_thread::sleep_for(timeLeftForFrame);
+                timeLeftForFrame = ZERO_MS;
+            }
+        }        
     }
 }
 
 
 std::chrono::milliseconds LoRaManager::sendNotAcked(
-    ThreadSafeQueue <std::pair<BaseMessage, messageUUID>> &queue,
+    ThreadSafeQueue <std::tuple<MessageVariant, messageUUID, timeToLive>> &queue,
     const std::chrono::milliseconds &timeToUse 
 ) {
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -42,15 +180,24 @@ std::chrono::milliseconds LoRaManager::sendNotAcked(
     while (
         !isDownlink.load() && 
         !queue.empty() &&
-        timeLeftInFrame > std::chrono::milliseconds(0)
+        timeLeftInFrame > ZERO_MS
     ) {
-        auto &[message, uuid] = queue.front();
-        loraDevice.send(
-            message.sendableBytes(),
-            timeLeftInFrame
+        auto &[message, uuid, ttl] = queue.front();
+        std::visit(
+            [&] (auto &msg) {
+                loraDevice.send(
+                    msg.sendableBytes(),
+                    timeLeftInFrame
+                );
+            },
+            message
         );
         
-        queue.push(std::make_pair(message, uuid));
+        
+        if (--ttl > 0) {
+            queue.push(std::make_tuple(message, uuid, ttl));
+        }
+
         queue.pop();
 
         timeLeftInFrame = FRAME_WINDOW_MS - std::chrono::duration_cast <std::chrono::milliseconds> (
@@ -62,7 +209,7 @@ std::chrono::milliseconds LoRaManager::sendNotAcked(
 }
 
 std::chrono::milliseconds LoRaManager::sendNewMessages(
-    ThreadSafeQueue <BaseMessage> &queue,
+    ThreadSafeQueue <MessageVariant> &queue,
     const std::chrono::milliseconds &timeToUse 
 ) {
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -71,15 +218,25 @@ std::chrono::milliseconds LoRaManager::sendNewMessages(
     while (
         !isDownlink.load() && 
         !queue.empty() &&
-        timeLeftInFrame > std::chrono::milliseconds(0)
+        timeLeftInFrame > ZERO_MS
     ) {
-        BaseMessage &message = queue.front();
-        loraDevice.send(
-            message.sendableBytes(),
-            timeLeftInFrame
+        MessageVariant &message = queue.front();
+
+        std::visit(
+            [&](auto &msg) {
+                msg.setMessageNo(sentMessageCounter++);
+                loraDevice.send(
+                    msg.sendableBytes(),
+                    timeLeftInFrame
+                );
+            },
+            message
         );
         
-        notAckedQueue.push(std::make_pair(message, makeUUID(message)));
+        notAckedQueue.push(
+            std::make_tuple(message, makeUUID(message), DEFAULT_TTL)
+        );
+
         queue.pop();
 
         timeLeftInFrame = FRAME_WINDOW_MS - std::chrono::duration_cast <std::chrono::milliseconds> (
@@ -93,81 +250,101 @@ std::chrono::milliseconds LoRaManager::sendNewMessages(
 /*
 This function should be executed within FRAME_WINDOW_MS
 */
-void LoRaManager::sendThreadFunction() {
+std::chrono::milliseconds LoRaManager::receiveMessages(
+    ThreadSafeQueue <std::vector <uint8_t>> &queue,
+    const std::chrono::milliseconds &timeToUse
+) {
     auto startTime = std::chrono::high_resolution_clock::now();
-    std::chrono::milliseconds timeLeftInFrame{FRAME_WINDOW_MS};
-    
-    // loraDevice.setTransmitMode();
-    uint32_t expectedAckCount{0};
-    // unordered map doesn't work here
-    // std::map <
-    //     std::pair <addressType, uint16_t>, bool
-    // > acknowledgedMap;
+    std::chrono::milliseconds timeLeftInFrame{timeToUse};
+
     while (
-        !isDownlink.load() && 
-        !toSendQueue.empty() &&
-        // std::chrono::duration_cast <std::chrono::milliseconds> (
-        //     std::chrono::high_resolution_clock::now() - startTime
-        // ) < FRAME_UL_DL_MS
-        timeLeftInFrame > std::chrono::milliseconds(0)
+        isDownlink.load() && 
+        !queue.empty() &&
+        timeLeftInFrame > ZERO_MS
     ) {
-        // for (uint16_t i = 0; i < messages.size(); ++i) {
-        BaseMessage &message = toSendQueue.front();
-        // acknowledgedMap[std::make_pair(message.getDestinationAddress(), i)] = false;
+        MessageVariant messageVariant = decodeFromBytes(queue.front());
+        
+        receivedQueue.push(messageVariant);
 
-        loraDevice.send(
-            message.sendableBytes(), 
-            // this strategy might require adjustments - 
-            // we can either limit message send time or 
-            // we can send them in order - if some are not sent, 
-            // leave it for next time
-            // FRAME_UL_DL_MS / messages.size()
-
-            // we'll do just it ;)
-            timeLeftInFrame
+        std::visit(
+            overloaded {
+                [](BadMessage &messageBad) -> void {
+                    // ignore this message
+                    return;
+                },
+                [](MessageACK &messageAck) -> void {
+                    // do not ack the ack message
+                    Logger::debug(
+                        "LoRaManager::RECEIVE-MSG", 
+                        "Acked from: " + std::to_string(messageAck.getSenderAddress()) + " message NO: " + std::to_string(messageAck.getMessageNo())
+                    );
+                    return;
+                },
+                [&](MessageRandomAccess &messageRandAccess) -> void {
+                    // send MessageRandom Access Confirmation
+                    MessageRandomAccessResponse msgRAR(
+                        getMyAddress(),
+                        getTotalNumberOfDevicesInNetwork()
+                    );
+                    msgRAR.setDestinationAddress(broadcastAddress);
+                    if (totalNumberOfDevicesInNetwork <= 1) {
+                        // edge case talk to driver
+                        Logger::debug("LoRaManager::RECEIVE-MSG", "received RAC, talking to the driver");
+                        loraDevice.send(msgRAR.sendableBytes(), timeLeftInFrame);
+                    } else {
+                        addToSendQueue(msgRAR);
+                    }
+                    ++totalNumberOfDevicesInNetwork;
+                    return;
+                },
+                [ & ](auto &message) -> void {
+                    Logger::debug("LoRaManager::RECEIVE-MSG", "MESSAGE TO ACK: " + message.name());
+                    toAckQueue.push(
+                        MessageACK(
+                            myAddress,
+                            message.getSenderAddress(),
+                            message.getMessageNo()
+                        )
+                    );
+                }
+            },
+            messageVariant
         );
 
-        ++expectedAckCount;
-        notAckedQueue.push(std::make_pair(message, makeUUID(message)));
-        toSendQueue.pop();
+        queue.pop();
 
         timeLeftInFrame = FRAME_WINDOW_MS - std::chrono::duration_cast <std::chrono::milliseconds> (
             std::chrono::high_resolution_clock::now() - startTime
         );
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    return;
+    return timeLeftInFrame;
+}
 
-    // loraDevice.setReceiveMode();
-    for (const auto &messageBytes : loraDevice.tryReceive(FRAME_ACK_MS)) {
-        // we should retrevie only ACKS here
-        std::visit(overloaded {
-                [ & ](MessageACK &message) -> void {
-                    // acknowledgedMap[message.getSenderAddress()] = true;
-                    --expectedAckCount;
-                },
-                [ ](auto &&message) -> void {
-                    // ignore other messages
-                    return;
-                }
-            },
-            decodeFromBytes(messageBytes)
+std::chrono::milliseconds LoRaManager::sendAck(
+    ThreadSafeQueue <MessageACK> &queue,
+    const std::chrono::milliseconds &timeToUse
+) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+    std::chrono::milliseconds timeLeftInFrame{timeToUse};
+
+    while (
+        !isDownlink.load() && 
+        !queue.empty() &&
+        timeLeftInFrame > ZERO_MS
+    ) {
+        MessageACK &messageAck = queue.front();
+        loraDevice.send(
+            messageAck.sendableBytes(),
+            timeLeftInFrame
+        );
+        
+        queue.pop();
+
+        timeLeftInFrame = FRAME_WINDOW_MS - std::chrono::duration_cast <std::chrono::milliseconds> (
+            std::chrono::high_resolution_clock::now() - startTime
         );
     }
 
-    // for (auto &[peerAddress, ack] : acknowledgedMap) {
-    //     if (!ack) {
-            
-    //     }
-    // }
-
-    // return expectedAckCount ? SendResult::SENT_NO_ACK : SendResult::SENT_ACK;
-}
-
-/*
-This function should be executed within FRAME_WINDOW_MS
-*/
-std::vector <MessageVariant> LoRaManager::receiveMessages() {
-
+    return timeLeftInFrame;
 }

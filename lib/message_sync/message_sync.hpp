@@ -2,27 +2,24 @@
 
 #include "base_message.hpp"
 
-static constexpr messageIdType MESSAGE_ACK {1};
+static constexpr messageIdType MESSAGE_SYNCH {5};
 
-class MessageACK : public BaseMessage {
+class MessageSynchronise : public BaseMessage {
 public:
-    MessageACK() = default;
-    MessageACK(
-        const addressType myAddress,
-        const addressType ackDestination,
-        const messageNoType ackMessageNumber
-    ) {
+    MessageSynchronise() = default;
+    
+    MessageSynchronise(addressType myAddress, messageNoType messageNo) {
         setSenderAddress(myAddress);
-        setDestinationAddress(ackDestination);
-        setMessageNo(ackMessageNumber);
-    }
+        setDestinationAddress(broadcastAddress);
+        setMessageNo(messageNo);
+    };
 
     inline messageIdType messageId() const override {
-        return MESSAGE_ACK;
+        return MESSAGE_SYNCH;
     }
 
     inline std::string name() const override {
-        return "MessageACK";
+        return "MessageSynchronise";
     }
     
     inline std::vector <uint8_t> sendableBytes() const override {
